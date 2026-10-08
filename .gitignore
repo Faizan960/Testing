@@ -1,0 +1,26 @@
+# Gradle / Android
+.gradle/
+.kotlin/
+.idea/
+**/build/
+build/
+local.properties
+*.iml
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.jks
+*.keystore
+*.hprof
+.cxx/
+.externalNativeBuild/
+/captures/
+
+# Logs and local files
+*.log
+activities.txt
+full_logcat.txt
+log*.txt
+screen.png
