@@ -1,12 +1,17 @@
 package com.niyyah.masjiddemo
 
+import android.Manifest
 import android.app.NotificationManager
+import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -18,28 +23,18 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
-
-import android.util.Log
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
-        Log.d("NiyyahMasjidDemo", "onCreate: started")
         super.onCreate(savedInstanceState)
-        Log.d("NiyyahMasjidDemo", "onCreate: calling setContent")
-        setContent { 
-            Log.d("NiyyahMasjidDemo", "setContent: inside root composable")
-            NiyyahMasjidDemo() 
-        }
+        setContent { NiyyahMasjidDemo() }
     }
 
     private fun notificationManager() = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
     private fun hasDndAccess(): Boolean = notificationManager().isNotificationPolicyAccessGranted
-
-    private fun isDndCurrentlyOn(): Boolean {
-        val filter = notificationManager().currentInterruptionFilter
-        return filter != NotificationManager.INTERRUPTION_FILTER_ALL
-    }
+    private fun isDndCurrentlyOn(): Boolean =
+        notificationManager().currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL
 
     private fun openDndSettings() {
         startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
@@ -64,24 +59,95 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun NiyyahMasjidDemo() {
-        Log.d("NiyyahMasjidDemo", "NiyyahMasjidDemo: executing")
         var inside by remember { mutableStateOf(false) }
-        var hasAccess by remember { mutableStateOf(hasDndAccess()) }
-        var dndOn by remember { mutableStateOf(if (hasAccess) isDndCurrentlyOn() else false) }
+        var beaconDetected by remember { mutableStateOf(false) }
+        var beaconRssi by remember { mutableStateOf<Int?>(null) }
+        var hasDndAccess by remember { mutableStateOf(hasDndAccess()) }
+        var dndOn by remember { mutableStateOf(if (hasDndAccess) isDndCurrentlyOn() else false) }
         var previousDndFilter by remember { mutableStateOf(NotificationManager.INTERRUPTION_FILTER_ALL) }
         var message by remember { mutableStateOf("Waiting for the ESP32 beacon…") }
+        var bluetoothEnabled by remember { mutableStateOf(false) }
 
-        // Auto-refresh permission when returning from settings
+        val scanner = remember {
+            BleMasjidScanner(
+                context = this@MainActivity,
+                onBeaconDetected = { rssi ->
+                    beaconRssi = rssi
+                    beaconDetected = true
+                    if (!inside) {
+                        previousDndFilter = notificationManager().currentInterruptionFilter
+                        inside = true
+                        if (hasDndAccess()) {
+                            val success = setDnd(true)
+                            dndOn = if (success) true else isDndCurrentlyOn()
+                            message = if (success) "Masjid beacon detected. Masjid Mode enabled."
+                            else "Beacon detected, but DND access is unavailable."
+                        } else {
+                            dndOn = isDndCurrentlyOn()
+                            message = "Beacon detected. Grant DND access to enable Masjid Mode."
+                        }
+                    } else {
+                        message = "Masjid beacon detected. RSSI " + rssi + " dBm."
+                    }
+                },
+                onBeaconLost = {
+                    beaconDetected = false
+                    beaconRssi = null
+                    if (inside && hasDndAccess()) setDndFilter(previousDndFilter)
+                    inside = false
+                    dndOn = if (hasDndAccess()) isDndCurrentlyOn() else false
+                    message = "Masjid beacon lost. Previous DND state restored."
+                },
+                onError = { error -> message = error }
+            )
+        }
+
+        fun refreshBluetoothState() { bluetoothEnabled = scanner.isBluetoothEnabled() }
+        fun refreshDndState() {
+            hasDndAccess = hasDndAccess()
+            dndOn = if (hasDndAccess) isDndCurrentlyOn() else false
+        }
+
+        val blePermissionLauncher = rememberLauncherForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions()
+        ) { results ->
+            if (results.values.all { it }) {
+                message = "Nearby-device access granted. Starting beacon scan…"
+                refreshBluetoothState()
+                scanner.start()
+            } else {
+                message = "Nearby-device permission is required to detect the masjid beacon."
+            }
+        }
+
+        fun requestBlePermissions() {
+            val permissions = if (Build.VERSION.SDK_INT >= 31) arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+            blePermissionLauncher.launch(permissions)
+        }
+
+        fun hasBlePermissions(): Boolean = scanner.hasScanPermission() && scanner.hasConnectPermission()
+
         val lifecycleOwner = LocalLifecycleOwner.current
-        DisposableEffect(lifecycleOwner) {
+        DisposableEffect(lifecycleOwner, scanner) {
             val observer = LifecycleEventObserver { _, event ->
-                if (event == Lifecycle.Event.ON_RESUME) {
-                    hasAccess = hasDndAccess()
-                    dndOn = if (hasAccess) isDndCurrentlyOn() else false
+                when (event) {
+                    Lifecycle.Event.ON_RESUME -> {
+                        refreshDndState()
+                        refreshBluetoothState()
+                        if (hasBlePermissions() && bluetoothEnabled) scanner.start()
+                    }
+                    Lifecycle.Event.ON_PAUSE -> scanner.stop()
+                    else -> Unit
                 }
             }
             lifecycleOwner.lifecycle.addObserver(observer)
-            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+            onDispose {
+                lifecycleOwner.lifecycle.removeObserver(observer)
+                scanner.stop()
+            }
         }
 
         MaterialTheme(colorScheme = lightColorScheme()) {
@@ -96,60 +162,92 @@ class MainActivity : ComponentActivity() {
 
                     Card(shape = RoundedCornerShape(24.dp), modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(22.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Text(if (inside) "Masjid detected" else "Outside masjid", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+                            Text(
+                                if (inside) "Masjid detected" else "Outside masjid",
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold
+                            )
                             Text(message)
                             HorizontalDivider()
-                            StatusRow("Beacon", if (inside) "DETECTED" else "NOT DETECTED")
+                            StatusRow("Beacon", if (beaconDetected) "DETECTED" else "NOT DETECTED")
+                            StatusRow("RSSI", beaconRssi?.let { String.format(Locale.US, "%d dBm", it) } ?: "—")
                             StatusRow("Zone", if (inside) "INSIDE" else "OUTSIDE")
+                            StatusRow("Bluetooth", if (bluetoothEnabled) "ON" else "OFF")
                             StatusRow("Do Not Disturb", if (dndOn) "ON" else "OFF")
                         }
                     }
 
-                    if (!hasAccess) {
+                    if (!scanner.hasScanPermission() || !scanner.hasConnectPermission()) {
+                        Button(onClick = { requestBlePermissions() }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Grant Nearby Device Access")
+                        }
+                    } else if (!bluetoothEnabled) {
+                        Button(
+                            onClick = {
+                                try { startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE)) }
+                                catch (_: Exception) { message = "Please enable Bluetooth from system settings." }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Enable Bluetooth") }
+                    } else {
+                        OutlinedButton(
+                            onClick = {
+                                refreshBluetoothState()
+                                refreshDndState()
+                                scanner.stop()
+                                scanner.start()
+                                message = "Scanning for NIYYAH-MASJID-TEST…"
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Restart Beacon Scan") }
+                    }
+
+                    if (!hasDndAccess) {
                         Button(onClick = { openDndSettings() }, modifier = Modifier.fillMaxWidth()) {
                             Text("Grant DND access")
                         }
-                        Text("Android requires your permission before an app can control Do Not Disturb.", style = MaterialTheme.typography.bodySmall)
-                    } else {
-                        OutlinedButton(onClick = {
-                            hasAccess = hasDndAccess()
-                            dndOn = if (hasAccess) isDndCurrentlyOn() else false
-                        }, modifier = Modifier.fillMaxWidth()) { Text("Refresh DND permission") }
+                        Text(
+                            "Android requires your permission before an app can control Do Not Disturb.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
                     }
 
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Button(
                             onClick = {
                                 if (hasDndAccess()) {
-                                    if (!inside) {
-                                        previousDndFilter = notificationManager().currentInterruptionFilter
-                                    }
+                                    if (!inside) previousDndFilter = notificationManager().currentInterruptionFilter
                                     inside = true
+                                    beaconDetected = true
+                                    message = "Simulated beacon detected."
                                     val success = setDnd(true)
                                     dndOn = if (success) true else isDndCurrentlyOn()
-                                    message = if (success) "Demo beacon detected. DND enabled." else "DND permission is not active."
                                 } else {
                                     message = "Grant DND access first."
                                 }
-                            }, modifier = Modifier.weight(1f)
+                            },
+                            modifier = Modifier.weight(1f)
                         ) { Text("Simulate Enter") }
+
                         OutlinedButton(
                             onClick = {
-                                if (hasDndAccess()) {
-                                    if (inside) {
-                                        setDndFilter(previousDndFilter)
-                                        inside = false
-                                    }
-                                    dndOn = isDndCurrentlyOn()
-                                    message = "Demo beacon lost. Previous DND state restored."
-                                } else {
-                                    message = "Grant DND access first."
+                                if (inside) {
+                                    if (hasDndAccess()) setDndFilter(previousDndFilter)
+                                    inside = false
                                 }
-                            }, modifier = Modifier.weight(1f)
+                                beaconDetected = false
+                                beaconRssi = null
+                                dndOn = if (hasDndAccess()) isDndCurrentlyOn() else false
+                                message = "Simulated beacon lost. Previous DND state restored."
+                            },
+                            modifier = Modifier.weight(1f)
                         ) { Text("Simulate Leave") }
                     }
 
-                    Text("Hardware mode will replace these two buttons with BLE beacon detection.", style = MaterialTheme.typography.bodySmall)
+                    Text(
+                        "Hardware mode scans for the ESP32 BLE beacon. The buttons remain for fallback testing.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                 }
             }
         }
